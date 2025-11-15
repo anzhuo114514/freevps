@@ -100,14 +100,17 @@ jobs:
           Write-Host "密码: $env:RDP_PASS"
           Write-Host "====================`n"
 
-          $startTime = [DateTime]::Parse($env:JOB_START_TIME)
+          # 修复：使用当前时间作为起始点（不依赖 github.job.startedAt）
+          $startTime = Get-Date
+          $totalRuntimeMinutes = 3500  # 与 timeout-minutes 保持一致
+
           while ($true) {
               $elapsed = (Get-Date) - $startTime
-              $remainingMinutes = 3500 - $elapsed.TotalMinutes  # 剩余运行时间
+              $remainingMinutes = $totalRuntimeMinutes - $elapsed.TotalMinutes  # 计算剩余时间
               
               Write-Host "[$(Get-Date -Format 'HH:mm:ss')] 保活中 - 已运行: $($elapsed.Hours)h$($elapsed.Minutes)m | 剩余: $([math]::Round($remainingMinutes))m"
               
-              # 当剩余时间不足20分钟时，触发下一次工作流
+              # 剩余时间不足20分钟时触发下一次工作流
               if ($remainingMinutes -le 20) {
                   Write-Host "⏳ 即将超时，触发下一次工作流..."
                   break
@@ -115,11 +118,9 @@ jobs:
               
               Start-Sleep -Seconds 300  # 每5分钟检查一次
           }
-        env:
-          JOB_START_TIME: ${{ github.job.startedAt }}
 
       - name: Trigger Next Workflow (Auto-Restart)
         uses: peter-evans/repository-dispatch@v3
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}  # 内置令牌自动授权
-          event-type: rdp_keep_alive  # 与 on.repository_dispatch.types 对应
+          token: ${{ secrets.GITHUB_TOKEN }}
+          event-type: rdp_keep_alive
