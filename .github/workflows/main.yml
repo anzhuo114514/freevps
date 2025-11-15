@@ -1,17 +1,17 @@
-name: RDP
-
+name: RDP with Unlimited Keep-Alive
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 支持手动触发
+  repository_dispatch:  # 支持自循环触发
+    types: [rdp_keep_alive]
 
 jobs:
-  secure-rdp:
+  rdp-with-keepalive:
     runs-on: windows-latest
-    timeout-minutes: 3600
-
+    timeout-minutes: 3500  # 预留触发缓冲时间（约58小时）
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          # 启用远程桌面并配置基础设置
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -19,25 +19,23 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
+          # 清理旧防火墙规则并添加新规则
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # 重启远程桌面服务
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
+          # 生成强密码（包含大小写、数字、特殊字符）
           $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -46,32 +44,30 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          # 创建用户并添加到管理员组
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
           
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          # 存储凭据到环境变量（仅工作流内可见）
+          echo "RDP_USER=RDPUser" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # 连接 Tailscale 并获取 IP
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp-$env:GITHUB_RUN_ID
           
-          # Wait for Tailscale to assign an IP
+          # 等待 IP 分配（最多重试10次）
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -81,33 +77,49 @@ jobs:
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "Tailscale IP 分配失败"
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
+
+      - name: Verify RDP Connectivity
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+              Write-Error "RDP 端口连接失败"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "✅ RDP 连接测试成功"
 
-      - name: Maintain Connection
+      - name: Keep-Alive Loop (with auto-restart)
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
+          Write-Host "`n=== RDP 访问信息 ==="
+          Write-Host "地址: $env:TAILSCALE_IP"
+          Write-Host "用户名: $env:RDP_USER"
+          Write-Host "密码: $env:RDP_PASS"
+          Write-Host "====================`n"
+
+          $startTime = [DateTime]::Parse($env:JOB_START_TIME)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+              $elapsed = (Get-Date) - $startTime
+              $remainingMinutes = 3500 - $elapsed.TotalMinutes  # 剩余运行时间
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] 保活中 - 已运行: $($elapsed.Hours)h$($elapsed.Minutes)m | 剩余: $([math]::Round($remainingMinutes))m"
+              
+              # 当剩余时间不足20分钟时，触发下一次工作流
+              if ($remainingMinutes -le 20) {
+                  Write-Host "⏳ 即将超时，触发下一次工作流..."
+                  break
+              }
+              
+              Start-Sleep -Seconds 300  # 每5分钟检查一次
           }
+        env:
+          JOB_START_TIME: ${{ github.job.startedAt }}
+
+      - name: Trigger Next Workflow (Auto-Restart)
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}  # 内置令牌自动授权
+          event-type: rdp_keep_alive  # 与 on.repository_dispatch.types 对应
